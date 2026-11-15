@@ -1,0 +1,98 @@
+diff --git a/src/game/server/bots/bot.cpp b/src/game/server/bots/bot.cpp
+--- a/src/game/server/bots/bot.cpp
++++ b/src/game/server/bots/bot.cpp
+@@ -197,6 +197,9 @@
+ {
+     m_bRemoveOnDeath = false;
+     m_bRemoveNextThink = false;
++
++    m_cmd = NULL;
++    m_lastCmd = NULL;
+ }
+ 
+ //================================================================================
+@@ -216,6 +219,11 @@
+         m_nComponents[it]->Reset();
+     }
+ 
++    // Release the commands of the previous life (both point to heap CUserCmds
++    // allocated in Update(); usually the same object).
++    if ( m_lastCmd && m_lastCmd != m_cmd )
++        delete m_lastCmd;
++    delete m_cmd;
+     m_cmd = NULL;
+     m_lastCmd = NULL;
+ 
+@@ -282,6 +290,11 @@
+ {
+     VPROF_BUDGET( "PlayerMove", VPROF_BUDGETGROUP_BOTS );
+ 
++	// The previous frame's command is no longer referenced by anything:
++	// ProcessUsercmds() copies commands by value. Free it before replacing it.
++	if ( m_lastCmd && m_lastCmd != m_cmd )
++		delete m_lastCmd;
++
+ 	m_lastCmd = m_cmd;
+ 
+     // This is not necessary if the player is a human
+@@ -456,6 +469,8 @@
+     DebugDisplay();
+ 
+     const CUserCmd *playercmd = pPlayer->GetLastUserCommand();
++    if ( m_cmd && m_cmd != m_lastCmd )
++        delete m_cmd;
+     m_cmd = new CUserCmd();
+ 
+     m_cmd->command_number = playercmd->command_number;
+diff --git a/src/game/server/bots/components/bot_component_memory.cpp b/src/game/server/bots/components/bot_component_memory.cpp
+--- a/src/game/server/bots/components/bot_component_memory.cpp
++++ b/src/game/server/bots/components/bot_component_memory.cpp
+@@ -772,7 +772,11 @@
+ 
+     if ( !m_DataMemory.IsValidIndex( index ) ) {
+         if ( forceIfNotExists ) {
+-            return new CDataMemory();
++            // The GetDataMemoryInt/Float/... macros only read from the result and
++            // never free it. Return one shared, never-modified default instead of
++            // leaking a new CDataMemory on every lookup miss.
++            static CDataMemory s_DefaultDataMemory;
++            return &s_DefaultDataMemory;
+         }
+         else {
+             return NULL;
+@@ -787,12 +791,18 @@
+ void CBotMemory::ForgetData( const char * name )
+ {
+     string_t szName = AllocPooledString( name );
+-    m_DataMemory.Remove( szName );
++    int index = m_DataMemory.Find( szName );
++
++    if ( m_DataMemory.IsValidIndex( index ) ) {
++        CDataMemory *memory = m_DataMemory[index];
++        m_DataMemory.RemoveAt( index );
++        delete memory;
++    }
+ }
+ 
+ //================================================================================
+ //================================================================================ 
+ void CBotMemory::ForgetAllData()
+ {
+-    m_DataMemory.Purge();
++    m_DataMemory.PurgeAndDeleteElements();
+ }
+\ No newline at end of file
+diff --git a/src/game/server/bots/interfaces/ibotmemory.h b/src/game/server/bots/interfaces/ibotmemory.h
+--- a/src/game/server/bots/interfaces/ibotmemory.h
++++ b/src/game/server/bots/interfaces/ibotmemory.h
+@@ -102,8 +102,8 @@
+         m_pIdealThreat = NULL;
+         m_flNearbyDistance = 1000.0;
+ 
+-        m_Memory.Purge();
+-        m_DataMemory.Purge();
++        m_Memory.PurgeAndDeleteElements();
++        m_DataMemory.PurgeAndDeleteElements();
+     }
+ 
+     virtual bool ItsImportant() const {
