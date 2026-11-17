@@ -87,8 +87,54 @@ See [TECHNICAL.md](TECHNICAL.md) for the full analysis. In short:
    free garbage.
 
 Small leaks remain: task objects, components dropped on respawn, and the controllers of
-kicked bots. A periodic (e.g. daily) server restart covers them. Fixing them properly
-needs a source change.
+kicked bots. Fixing them properly needs a source change. Until then, recycle servers by
+memory use, not just by a daily timer (see below).
+
+## Servers stuck "down" after running out of memory (use the guard)
+
+The patch slows the leak but does not stop it. In production, two patched servers with 4-8
+bots still ran out of 32-bit address space (about 3.5 GB private) within 1-2 days. Growth
+was well above the 2-3 MB/h per bot measured in the soak test, so a daily restart alone isn't
+enough.
+
+When that happens, the server can't be reached afterwards, even after a restart:
+
+1. srcds runs out of memory and starts exiting.
+2. While SourceMod unloads, it crashes.
+3. SourceMod's crash reporter (the **Accelerator** extension) catches that crash and waits
+   forever for its dump thread. Process exit has already killed that thread, so the wait
+   never ends.
+4. The process never finishes exiting. It keeps its UDP ports, and `taskkill /F` and
+   `TerminateProcess` can't remove it (`taskkill` reports "no running instance").
+5. A nightly restart starts a new instance, which quietly binds the *next* free port (for
+   example 27016 instead of 27015). Players connecting to the usual port reach nothing.
+
+Fixes, in order of importance:
+
+- **Disable Accelerator** on Open Fortress servers. Rename
+  `addons/sourcemod/extensions/accelerator.autoload`, then restart. You lose SourceMod crash
+  reports, but this hang can't happen any more.
+- **Run [`guard/of_guard.ps1`](guard/of_guard.ps1)** every few minutes from Task Scheduler,
+  under the same Windows account as the servers. For each `srcds.exe -game open_fortress` it:
+  - finds instances stuck as above and terminates their stuck thread, so the exit finishes
+    and the ports and memory are freed (it falls back to closing the process's handles from
+    outside);
+  - terminates an instance once its private bytes pass `-SoftLimitMB` (default 2600) and A2S
+    reports no humans, so your launch loop restarts it;
+  - terminates it regardless above `-HardLimitMB` (default 3300), because it's about to fail.
+
+  It uses `TerminateProcess`, which skips DLL unload and so can't hit the hang. It expects
+  each server to run in a `:srcds ... goto srcds` loop that restarts it.
+
+```powershell
+$args = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "C:\path\to\guard\of_guard.ps1" -QueryHost <server ip> -LogPath "C:\path\to\of_guard.csv"'
+$a = New-ScheduledTaskAction -Execute powershell.exe -Argument $args
+$t = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName OpenFortressGuard -Action $a -Trigger $t `
+  -Settings (New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 4))
+```
+
+Run it once with `-WhatIf` first to see what it would do.
 
 ## For the Open Fortress developers
 
